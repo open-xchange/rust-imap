@@ -29,7 +29,8 @@ path = "src/lib.rs"
 native-tls = "0.2.2"
 regex = "1.0"
 bufstream = "0.1"
-imap-proto = "0.7"
+# imap-proto = "0.7"
+imap-proto = { path = "../tokio-imap/imap-proto" }
 nom = "4.0"
 base64 = "0.10"
 
