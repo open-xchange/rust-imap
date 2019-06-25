@@ -31,21 +31,28 @@ use std::hash::Hash;
 pub struct Capabilities(
     // Note that this field isn't *actually* 'static.
     // Rather, it is tied to the lifetime of the `ZeroCopy` that contains this `Name`.
-    pub(crate) HashSet<&'static str>,
+    pub(crate) HashSet<imap_proto::Capability<'static>>,
 );
 
 impl Capabilities {
     /// Check if the server has the given capability.
-    pub fn has<S: ?Sized>(&self, s: &S) -> bool
-    where
-        for<'a> &'a str: Borrow<S>,
-        S: Hash + Eq,
+    pub fn has(&self, s: &imap_proto::Capability) -> bool
+    // where
+    //     for<'a> &'a str: Borrow<S>,
+    //     S: Hash + Eq,
     {
         self.0.contains(s)
     }
+    // pub fn has<S: ?Sized>(&self, s: &S) -> bool
+    // where
+    //     for<'a> &'a str: Borrow<S>,
+    //     S: Hash + Eq,
+    // {
+    //     self.0.contains(s)
+    // }
 
     /// Iterate over all the server's capabilities
-    pub fn iter(&self) -> Iter<&str> {
+    pub fn iter(&self) -> Iter<imap_proto::Capability> {
         self.0.iter()
     }
 
