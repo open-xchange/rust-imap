@@ -331,10 +331,14 @@ fn handle_unilateral<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use imap_proto::types::*;
 
     #[test]
     fn parse_capability_test() {
-        let expected_capabilities = vec!["IMAP4rev1", "STARTTLS", "AUTH=GSSAPI", "LOGINDISABLED"];
+        let expected_capabilities = vec![ Capability::Imap4rev1,
+                                          Capability::Atom("STARTTLS"),
+                                          Capability::Auth("GSSAPI"),
+                                          Capability::Atom("LOGINDISABLED")];
         let lines = b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n";
         let (mut send, recv) = mpsc::channel();
         let capabilities = parse_capabilities(lines.to_vec(), &mut send).unwrap();
@@ -342,7 +346,7 @@ mod tests {
         assert!(recv.try_recv().is_err());
         assert_eq!(capabilities.len(), 4);
         for e in expected_capabilities {
-            assert!(capabilities.has(e));
+            assert!(capabilities.has(&e));
         }
     }
 
@@ -435,7 +439,11 @@ mod tests {
 
     #[test]
     fn parse_capabilities_w_unilateral() {
-        let expected_capabilities = vec!["IMAP4rev1", "STARTTLS", "AUTH=GSSAPI", "LOGINDISABLED"];
+        let expected_capabilities = vec![
+            Capability::Imap4rev1,
+            Capability::Atom("STARTTLS"),
+            Capability::Auth("GSSAPI"),
+            Capability::Atom("LOGINDISABLED")];
         let lines = b"\
                     * CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n\
                     * STATUS dev.github (MESSAGES 10 UIDNEXT 11 UIDVALIDITY 1408806928 UNSEEN 0)\r\n\
@@ -445,7 +453,7 @@ mod tests {
 
         assert_eq!(capabilities.len(), 4);
         for e in expected_capabilities {
-            assert!(capabilities.has(e));
+            assert!(capabilities.has(&e));
         }
 
         assert_eq!(
