@@ -998,6 +998,11 @@ impl<T: Read + Write> Session<T> {
         extensions::idle::Handle::make(self)
     }
 
+    /// Doc stub
+    pub fn enable<S: AsRef<str>>(&mut self, capabilities: S) -> ZeroCopyResult<Capabilities> {
+        self.run_command_and_read_response(&format!("ENABLE {}", capabilities.as_ref())).and_then(|lines| parse_capabilities(lines, &mut self.unsolicited_responses_tx))
+    }
+
     /// The [`APPEND` command](https://tools.ietf.org/html/rfc3501#section-6.3.11) appends
     /// `content` as a new message to the end of the specified destination `mailbox`.  This
     /// argument SHOULD be in the format of an [RFC-2822](https://tools.ietf.org/html/rfc2822)
