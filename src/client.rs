@@ -25,7 +25,7 @@ macro_rules! quote {
     };
 }
 
-fn validate_str(value: &str) -> Result<String> {
+pub(crate) fn validate_str(value: &str) -> Result<String> {
     let quoted = quote!(value);
     if quoted.find('\n').is_some() {
         return Err(Error::Validate(ValidateError('\n')));
@@ -48,7 +48,7 @@ fn validate_str(value: &str) -> Result<String> {
 #[derive(Debug)]
 pub struct Session<T: Read + Write> {
     conn: Connection<T>,
-    unsolicited_responses_tx: mpsc::Sender<UnsolicitedResponse>,
+    pub(crate) unsolicited_responses_tx: mpsc::Sender<UnsolicitedResponse>,
 
     /// Server responses that are not related to the current command. See also the note on
     /// [unilateral server responses in RFC 3501](https://tools.ietf.org/html/rfc3501#section-7).

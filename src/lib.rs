@@ -81,6 +81,8 @@ pub use client::*;
 pub mod error;
 
 pub mod extensions;
+// mod metadata;
+pub use extensions::metadata::{set_metadata, get_metadata};
 
 #[cfg(test)]
 mod mock_stream;
