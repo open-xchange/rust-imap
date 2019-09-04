@@ -30,7 +30,7 @@ native-tls = "0.2.2"
 regex = "1.0"
 bufstream = "0.1"
 # imap-proto = "0.7"
-imap-proto = { path = "../tokio-imap/imap-proto" }
+imap-proto = { git = "https://github.com/open-xchange/tokio-imap", branch = "metadata" }
 nom = "4.0"
 base64 = "0.10"
 chrono = "0.4"
