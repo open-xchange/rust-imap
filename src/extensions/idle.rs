@@ -3,10 +3,12 @@
 
 use client::Session;
 use error::{Error, Result};
+use mio::*;
 use native_tls::TlsStream;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
 ///
@@ -42,6 +44,24 @@ pub trait SetReadTimeout {
     ///
     /// See also `std::net::TcpStream::set_read_timeout`.
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()>;
+}
+
+/// Must be implemented for a transport in order for a `Session` using that
+/// transport to support interruptible operations.
+///
+/// Examples of where this is usedful is for `Handle::wait_interruptible`.
+pub trait Async {
+    /// The concrete type of the Evented implementation returned by `get_evented`.
+    type Ev: Evented;
+
+    /// Returns an implementation of Evented for async IO.
+    fn get_evented(&self) -> Self::Ev;
+
+    /// Set the transport to be blocking (the default, or when `nonblocking` is
+    /// `false`) or nonblocking (when `nonblocking` is `true`).
+    ///
+    /// See also `std::net::TcpStream::set_nonblocking`.
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<()>;
 }
 
 impl<'a, T: Read + Write + 'a> Handle<'a, T> {
@@ -109,16 +129,16 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
     pub fn wait(mut self) -> Result<()> {
         self.wait_inner()
     }
-}
 
-impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     /// Set the keep-alive interval to use when `wait_keepalive` is called.
     ///
     /// The interval defaults to 29 minutes as dictated by RFC 2177.
     pub fn set_keepalive(&mut self, interval: Duration) {
         self.keepalive = interval;
     }
+}
 
+impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     /// Block until the selected mailbox changes.
     ///
     /// This method differs from [`Handle::wait`] in that it will periodically refresh the IDLE
@@ -151,6 +171,90 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     }
 }
 
+/// A generic signal for [`mio`] used to terminate a `wait_interruptible`.
+pub struct Signal {
+    registration: Registration,
+    set_readiness: SetReadiness,
+}
+
+impl Signal {
+    fn new() -> Signal {
+        let (registration, set_readiness) = Registration::new2();
+        Signal {
+            registration,
+            set_readiness,
+        }
+    }
+
+    /// Send the signal, usually to terminate a `wait_interruptible`.
+    pub fn signal(&self) -> io::Result<()>{
+        self.set_readiness.set_readiness(Ready::readable())
+    }
+}
+
+impl Evented for Signal {
+    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()> {
+        self.registration.register(poll, token, interest,opts)
+    }
+
+    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()> {
+        self.registration.reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+        poll.deregister(&self.registration)
+    }
+}
+
+impl<'a, T: Read + Write + Async + Send + 'a> Handle<'a, T>
+    where <T as Async>::Ev: Send
+{
+    const DATA: Token = Token(0);
+    const STOP: Token = Token(1);
+
+    /// Returns a pair of functions which can be used to wait and to stop that wait.
+    pub fn wait_interruptible(mut self) -> Result<(Box<dyn FnOnce() -> Result<()> + Send + 'a>, Box<dyn FnOnce() -> Result<()>>)> {
+        let poll = Poll::new()?;
+
+        let ev = {
+            let stream = self.session.stream.get_ref();
+            stream.set_nonblocking(true)?;
+            let ev = stream.get_evented();
+            poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+            ev
+        };
+
+        let signal = Signal::new();
+        poll.register(&signal, Self::STOP, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+
+        let mut events = Events::with_capacity(2);
+
+        Ok((Box::new(move || {
+            'wait: loop {
+                poll.poll(&mut events, Some(self.keepalive))?;
+                if events.is_empty() {
+                    // Timeout: we need to refresh the IDLE connection
+                    self.terminate()?;
+                    self.init()?;
+                } else {
+                    for event in events.iter() {
+                        if event.token() == Self::STOP { break 'wait; }
+                        let mut v = Vec::new();
+                        match self.session.readline(&mut v) {
+                            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                            Err(e) => return Err(e),
+                            Ok(_) => break 'wait,
+                        }
+                        poll.reregister(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+                    }
+                }
+            }
+            self.session.stream.get_ref().set_nonblocking(false)?;
+            Ok(())
+        }), Box::new(move || signal.signal().map_err(Error::Io))))
+    }
+}
+
 impl<'a, T: Read + Write + 'a> Drop for Handle<'a, T> {
     fn drop(&mut self) {
         // we don't want to panic here if we can't terminate the Idle
@@ -167,5 +271,44 @@ impl<'a> SetReadTimeout for TcpStream {
 impl<'a> SetReadTimeout for TlsStream<TcpStream> {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.get_ref().set_read_timeout(timeout).map_err(Error::Io)
+    }
+}
+
+/// A copy of `mio::unix::EventedFd` which stores the `RawFd` instead of referencing it.
+pub struct EventedFd(RawFd);
+
+impl Evented for EventedFd {
+    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()>
+    {
+        unix::EventedFd(&self.0).register(poll, token, interest, opts)
+    }
+
+    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()>
+    {
+        unix::EventedFd(&self.0).reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+        unix::EventedFd(&self.0).deregister(poll)
+    }
+}
+
+impl Async for TcpStream {
+    type Ev = EventedFd;
+
+    fn get_evented(&self) -> Self::Ev { EventedFd(self.as_raw_fd()) }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        TcpStream::set_nonblocking(self, nonblocking).map_err(Error::Io)
+    }
+}
+
+impl<S: Read + Write + Async> Async for TlsStream<S> {
+    type Ev = S::Ev;
+
+    fn get_evented(&self) -> Self::Ev { self.get_ref().get_evented() }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        self.get_ref().set_nonblocking(nonblocking)
     }
 }
