@@ -1,7 +1,5 @@
-use std::borrow::Borrow;
 use std::collections::hash_set::Iter;
 use std::collections::HashSet;
-use std::hash::Hash;
 
 /// From [section 7.2.1 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-7.2.1).
 ///
