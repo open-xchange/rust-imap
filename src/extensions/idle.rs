@@ -65,14 +65,16 @@ pub trait Async {
 }
 
 impl<T: Read + Write> Handle<T> {
-    pub(crate) fn make(session: Session<T>) -> Result<Self> {
+    pub(crate) fn make(session: Session<T>) -> std::result::Result<Self, (Error, Session<T>)> {
         let mut h = Handle {
             session,
             keepalive: Duration::from_secs(29 * 60),
             done: false,
         };
-        h.init()?;
-        Ok(h)
+        match h.init() {
+            Ok(()) => Ok(h),
+            Err(err) => Err((err, h.session)),
+        }
     }
 
     fn init(&mut self) -> Result<()> {
@@ -126,8 +128,8 @@ impl<T: Read + Write> Handle<T> {
     }
 
     /// Block until the selected mailbox changes.
-    pub fn wait(mut self) -> Result<Session<T>> {
-        self.wait_inner().map(|_| self.session)
+    pub fn wait(mut self) -> (Result<()>, Session<T>) {
+        (self.wait_inner(), self.session)
     }
 
     /// Set the keep-alive interval to use when `wait_keepalive` is called.
@@ -147,7 +149,7 @@ impl<T: SetReadTimeout + Read + Write> Handle<T> {
     /// [`Handle::set_keepalive`].
     ///
     /// This is the recommended method to use for waiting.
-    pub fn wait_keepalive(self) -> Result<Session<T>> {
+    pub fn wait_keepalive(self) -> (Result<()>, Session<T>) {
         // The server MAY consider a client inactive if it has an IDLE command
         // running, and if such a server has an inactivity timeout it MAY log
         // the client off implicitly at the end of its timeout period.  Because
@@ -160,18 +162,20 @@ impl<T: SetReadTimeout + Read + Write> Handle<T> {
     }
 
     /// Block until the selected mailbox changes, or until the given amount of time has expired.
-    pub fn wait_timeout(mut self, timeout: Duration) -> Result<Session<T>> {
-        self.session
+    pub fn wait_timeout(mut self, timeout: Duration) -> (Result<()>, Session<T>) {
+        let res = self.session
             .stream
             .get_mut()
-            .set_read_timeout(Some(timeout))?;
-        let res = self.wait_inner();
+            .set_read_timeout(Some(timeout))
+
+            .and_then(|()| self.wait_inner());
+
         let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
-        res.map(|_| self.session)
+        (res, self.session)
     }
 }
 
-/// A generic signal for [`mio`] used to terminate a `wait_interruptible`.
+/// A generic signal used to terminate a `wait_interruptible`.
 pub struct Signal {
     registration: Registration,
     set_readiness: SetReadiness,
@@ -213,23 +217,38 @@ impl<'a, T: Read + Write + Async + Send + 'a> Handle<T>
     const STOP: Token = Token(1);
 
     /// Returns a pair of functions which can be used to wait and to stop that wait.
-    pub fn wait_interruptible(mut self) -> Result<(Box<dyn FnOnce() -> Result<Session<T>> + Send + 'a>, Box<dyn FnOnce() -> Result<()>>)> {
-        let poll = Poll::new()?;
-
-        let ev = {
-            let stream = self.session.stream.get_ref();
-            stream.set_nonblocking(true)?;
-            let ev = stream.get_evented();
-            poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-            ev
+    pub fn wait_interruptible(mut self) -> std::result::Result<(Box<dyn FnOnce() -> (Result<()>, Session<T>) + Send + 'a>,
+                                                                Box<dyn FnOnce() -> Result<()>>),
+                                                               (Error, Session<T>)>
+    {
+        let poll = match Poll::new() {
+            Ok(poll) => poll,
+            Err(err) => return Err((Error::Io(err), self.session)),
         };
 
         let signal = Signal::new();
-        poll.register(&signal, Self::STOP, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+        match poll.register(&signal, Self::STOP, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()) {
+            Ok(poll) => poll,
+            Err(err) => return Err((Error::Io(err), self.session)),
+        };
+
+        let ev = {
+            let stream = self.session.stream.get_ref();
+            match stream.set_nonblocking(true) {
+                Ok(poll) => poll,
+                Err(err) => return Err((err, self.session)),
+            };
+            let ev = stream.get_evented();
+            match poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()) {
+                Ok(poll) => poll,
+                Err(err) => return Err((Error::Io(err), self.session)),
+            };
+            ev
+        };
 
         let mut events = Events::with_capacity(2);
 
-        Ok((Box::new(move || {
+        Ok((Box::new(move || ((|| {
             'wait: loop {
                 poll.poll(&mut events, Some(self.keepalive))?;
                 if events.is_empty() {
@@ -250,8 +269,9 @@ impl<'a, T: Read + Write + Async + Send + 'a> Handle<T>
                 }
             }
             self.session.stream.get_ref().set_nonblocking(false)?;
-            Ok(self.session)
-        }), Box::new(move || signal.signal().map_err(Error::Io))))
+            self.terminate()?;
+            Ok(())
+        })(), self.session)), Box::new(move || signal.signal().map_err(Error::Io))))
     }
 }
 

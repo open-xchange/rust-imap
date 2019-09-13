@@ -994,7 +994,7 @@ impl<T: Read + Write> Session<T> {
     /// command, as specified in the base IMAP specification.
     ///
     /// See [`extensions::idle::Handle`] for details.
-    pub fn idle(self) -> Result<extensions::idle::Handle<T>> {
+    pub fn idle(self) -> std::result::Result<extensions::idle::Handle<T>, (Error, Self)> {
         extensions::idle::Handle::make(self)
     }
 
