@@ -26,8 +26,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 ///
 /// As long as a [`Handle`] is active, the mailbox cannot be otherwise accessed.
 #[derive(Debug)]
-pub struct Handle<'a, T: Read + Write + 'a> {
-    session: &'a mut Session<T>,
+pub struct Handle<T: Read + Write> {
+    session: Session<T>,
     keepalive: Duration,
     done: bool,
 }
@@ -64,8 +64,8 @@ pub trait Async {
     fn set_nonblocking(&self, nonblocking: bool) -> Result<()>;
 }
 
-impl<'a, T: Read + Write + 'a> Handle<'a, T> {
-    pub(crate) fn make(session: &'a mut Session<T>) -> Result<Self> {
+impl<T: Read + Write> Handle<T> {
+    pub(crate) fn make(session: Session<T>) -> Result<Self> {
         let mut h = Handle {
             session,
             keepalive: Duration::from_secs(29 * 60),
@@ -126,8 +126,8 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
     }
 
     /// Block until the selected mailbox changes.
-    pub fn wait(mut self) -> Result<()> {
-        self.wait_inner()
+    pub fn wait(mut self) -> Result<Session<T>> {
+        self.wait_inner().map(|_| self.session)
     }
 
     /// Set the keep-alive interval to use when `wait_keepalive` is called.
@@ -138,7 +138,7 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
     }
 }
 
-impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
+impl<T: SetReadTimeout + Read + Write> Handle<T> {
     /// Block until the selected mailbox changes.
     ///
     /// This method differs from [`Handle::wait`] in that it will periodically refresh the IDLE
@@ -147,7 +147,7 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     /// [`Handle::set_keepalive`].
     ///
     /// This is the recommended method to use for waiting.
-    pub fn wait_keepalive(self) -> Result<()> {
+    pub fn wait_keepalive(self) -> Result<Session<T>> {
         // The server MAY consider a client inactive if it has an IDLE command
         // running, and if such a server has an inactivity timeout it MAY log
         // the client off implicitly at the end of its timeout period.  Because
@@ -160,14 +160,14 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     }
 
     /// Block until the selected mailbox changes, or until the given amount of time has expired.
-    pub fn wait_timeout(mut self, timeout: Duration) -> Result<()> {
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<Session<T>> {
         self.session
             .stream
             .get_mut()
             .set_read_timeout(Some(timeout))?;
         let res = self.wait_inner();
         let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
-        res
+        res.map(|_| self.session)
     }
 }
 
@@ -206,14 +206,14 @@ impl Evented for Signal {
     }
 }
 
-impl<'a, T: Read + Write + Async + Send + 'a> Handle<'a, T>
+impl<'a, T: Read + Write + Async + Send + 'a> Handle<T>
     where <T as Async>::Ev: Send
 {
     const DATA: Token = Token(0);
     const STOP: Token = Token(1);
 
     /// Returns a pair of functions which can be used to wait and to stop that wait.
-    pub fn wait_interruptible(mut self) -> Result<(Box<dyn FnOnce() -> Result<()> + Send + 'a>, Box<dyn FnOnce() -> Result<()>>)> {
+    pub fn wait_interruptible(mut self) -> Result<(Box<dyn FnOnce() -> Result<Session<T>> + Send + 'a>, Box<dyn FnOnce() -> Result<()>>)> {
         let poll = Poll::new()?;
 
         let ev = {
@@ -250,25 +250,28 @@ impl<'a, T: Read + Write + Async + Send + 'a> Handle<'a, T>
                 }
             }
             self.session.stream.get_ref().set_nonblocking(false)?;
-            Ok(())
+            Ok(self.session)
         }), Box::new(move || signal.signal().map_err(Error::Io))))
     }
 }
 
-impl<'a, T: Read + Write + 'a> Drop for Handle<'a, T> {
+/* TODO: find a way to retrieve the session for the old wait_* functions
+
+impl<T: Read + Write> Drop for Handle<T> {
     fn drop(&mut self) {
         // we don't want to panic here if we can't terminate the Idle
         let _ = self.terminate().is_ok();
     }
 }
+*/
 
-impl<'a> SetReadTimeout for TcpStream {
+impl SetReadTimeout for TcpStream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         TcpStream::set_read_timeout(self, timeout).map_err(Error::Io)
     }
 }
 
-impl<'a> SetReadTimeout for TlsStream<TcpStream> {
+impl SetReadTimeout for TlsStream<TcpStream> {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.get_ref().set_read_timeout(timeout).map_err(Error::Io)
     }
