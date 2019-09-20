@@ -26,10 +26,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 ///
 /// As long as a [`Handle`] is active, the mailbox cannot be otherwise accessed.
 #[derive(Debug)]
-pub struct Handle<T: Read + Write> {
-    session: Session<T>,
+pub struct Handle<'a, T: Read + Write> {
+    session: &'a mut Session<T>,
     keepalive: Duration,
     done: bool,
+    poll: Poll,
 }
 
 /// Must be implemented for a transport in order for a `Session` using that transport to support
@@ -64,17 +65,16 @@ pub trait Async {
     fn set_nonblocking(&self, nonblocking: bool) -> Result<()>;
 }
 
-impl<T: Read + Write> Handle<T> {
-    pub(crate) fn make(session: Session<T>) -> std::result::Result<Self, (Error, Session<T>)> {
+impl<'a, T: Read + Write> Handle<'a, T> {
+    pub(crate) fn make(session: &'a mut Session<T>) -> Result<Self> {
         let mut h = Handle {
             session,
             keepalive: Duration::from_secs(29 * 60),
             done: false,
+            poll: Poll::new()?,
         };
-        match h.init() {
-            Ok(()) => Ok(h),
-            Err(err) => Err((err, h.session)),
-        }
+        h.init()?;
+        Ok(h)
     }
 
     fn init(&mut self) -> Result<()> {
@@ -128,8 +128,8 @@ impl<T: Read + Write> Handle<T> {
     }
 
     /// Block until the selected mailbox changes.
-    pub fn wait(mut self) -> (Result<()>, Session<T>) {
-        (self.wait_inner(), self.session)
+    pub fn wait(mut self) -> Result<()> {
+        self.wait_inner()
     }
 
     /// Set the keep-alive interval to use when `wait_keepalive` is called.
@@ -140,7 +140,7 @@ impl<T: Read + Write> Handle<T> {
     }
 }
 
-impl<T: SetReadTimeout + Read + Write> Handle<T> {
+impl<'a, T: SetReadTimeout + Read + Write> Handle<'a, T> {
     /// Block until the selected mailbox changes.
     ///
     /// This method differs from [`Handle::wait`] in that it will periodically refresh the IDLE
@@ -149,7 +149,7 @@ impl<T: SetReadTimeout + Read + Write> Handle<T> {
     /// [`Handle::set_keepalive`].
     ///
     /// This is the recommended method to use for waiting.
-    pub fn wait_keepalive(self) -> (Result<()>, Session<T>) {
+    pub fn wait_keepalive(self) -> Result<()> {
         // The server MAY consider a client inactive if it has an IDLE command
         // running, and if such a server has an inactivity timeout it MAY log
         // the client off implicitly at the end of its timeout period.  Because
@@ -162,20 +162,19 @@ impl<T: SetReadTimeout + Read + Write> Handle<T> {
     }
 
     /// Block until the selected mailbox changes, or until the given amount of time has expired.
-    pub fn wait_timeout(mut self, timeout: Duration) -> (Result<()>, Session<T>) {
-        let res = self.session
+    pub fn wait_timeout(mut self, timeout: Duration) -> Result<()> {
+        self.session
             .stream
             .get_mut()
-            .set_read_timeout(Some(timeout))
-
-            .and_then(|()| self.wait_inner());
-
+            .set_read_timeout(Some(timeout))?;
+        let res = self.wait_inner();
         let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
-        (res, self.session)
+        res
     }
 }
 
 /// A generic signal used to terminate a `wait_interruptible`.
+#[derive(Debug)]
 pub struct Signal {
     registration: Registration,
     set_readiness: SetReadiness,
@@ -191,8 +190,8 @@ impl Signal {
     }
 
     /// Send the signal, usually to terminate a `wait_interruptible`.
-    pub fn signal(&self) -> io::Result<()>{
-        self.set_readiness.set_readiness(Ready::readable())
+    pub fn signal(self) -> Result<()>{
+        self.set_readiness.set_readiness(Ready::readable()).map_err(Error::Io)
     }
 }
 
@@ -210,80 +209,63 @@ impl Evented for Signal {
     }
 }
 
-impl<'a, T: Read + Write + Async + Send + 'a> Handle<T>
+impl<'a, T: Read + Write + Async + Send> Handle<'a, T>
     where <T as Async>::Ev: Send
 {
     const DATA: Token = Token(0);
     const STOP: Token = Token(1);
 
-    /// Returns a pair of functions which can be used to wait and to stop that wait.
-    pub fn wait_interruptible(mut self) -> std::result::Result<(Box<dyn FnOnce() -> (Result<()>, Session<T>) + Send + 'a>,
-                                                                Box<dyn FnOnce() -> Result<()>>),
-                                                               (Error, Session<T>)>
-    {
-        let poll = match Poll::new() {
-            Ok(poll) => poll,
-            Err(err) => return Err((Error::Io(err), self.session)),
-        };
-
+    /// Returns a `Signal` which can be used to interrupt a pending `wait_interruptible`.
+    pub fn get_interrupt(&mut self) -> Result<Signal> {
         let signal = Signal::new();
-        match poll.register(&signal, Self::STOP, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()) {
-            Ok(poll) => poll,
-            Err(err) => return Err((Error::Io(err), self.session)),
-        };
+        self.poll.register(&signal, Self::STOP, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+        Ok(signal)
+    }
 
+    /// Returns a pair of functions which can be used to wait and to stop that wait.
+    pub fn wait_interruptible(mut self) -> Result<()>
+    {
         let ev = {
             let stream = self.session.stream.get_ref();
-            match stream.set_nonblocking(true) {
-                Ok(poll) => poll,
-                Err(err) => return Err((err, self.session)),
-            };
+            stream.set_nonblocking(true)?;
             let ev = stream.get_evented();
-            match poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()) {
-                Ok(poll) => poll,
-                Err(err) => return Err((Error::Io(err), self.session)),
-            };
+            self.poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
             ev
         };
 
         let mut events = Events::with_capacity(2);
 
-        Ok((Box::new(move || ((|| {
-            'wait: loop {
-                poll.poll(&mut events, Some(self.keepalive))?;
-                if events.is_empty() {
-                    // Timeout: we need to refresh the IDLE connection
-                    self.terminate()?;
-                    self.init()?;
-                } else {
-                    for event in events.iter() {
-                        if event.token() == Self::STOP { break 'wait; }
-                        let mut v = Vec::new();
-                        match self.session.readline(&mut v) {
-                            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
-                            Err(e) => return Err(e),
-                            Ok(_) => break 'wait,
-                        }
-                        poll.reregister(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+        'wait: loop {
+            self.poll.poll(&mut events, Some(self.keepalive))?;
+            if events.is_empty() {
+                // Timeout: we need to refresh the IDLE connection
+                self.terminate()?;
+                self.init()?;
+            } else {
+                for event in events.iter() {
+                    if event.token() == Self::STOP { break 'wait; }
+                    let mut v = Vec::new();
+                    match self.session.readline(&mut v) {
+                        Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                        Err(e) => return Err(e),
+                        Ok(_) => break 'wait,
                     }
+                    self.poll.reregister(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
                 }
             }
-            self.session.stream.get_ref().set_nonblocking(false)?;
-            self.terminate()?;
-            Ok(())
-        })(), self.session)), Box::new(move || signal.signal().map_err(Error::Io))))
+        }
+
+        self.session.stream.get_ref().set_nonblocking(false)?;
+        Ok(())
     }
 }
 
-/* TODO: find a way to retrieve the session for the old wait_* functions
-
-impl<T: Read + Write> Drop for Handle<T> {
+impl<'a, T: Read + Write> Drop for Handle<'a, T> {
     fn drop(&mut self) {
         // we don't want to panic here if we can't terminate the Idle
         let _ = self.terminate().is_ok();
     }
 }
-*/
 
 impl SetReadTimeout for TcpStream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
