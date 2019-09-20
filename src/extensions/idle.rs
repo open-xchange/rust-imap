@@ -26,7 +26,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 ///
 /// As long as a [`Handle`] is active, the mailbox cannot be otherwise accessed.
 #[derive(Debug)]
-pub struct Handle<'a, T: Read + Write> {
+pub struct Handle<'a, T: Read + Write + 'a> {
     session: &'a mut Session<T>,
     keepalive: Duration,
     done: bool,
@@ -65,7 +65,7 @@ pub trait Async {
     fn set_nonblocking(&self, nonblocking: bool) -> Result<()>;
 }
 
-impl<'a, T: Read + Write> Handle<'a, T> {
+impl<'a, T: Read + Write + 'a> Handle<'a, T> {
     pub(crate) fn make(session: &'a mut Session<T>) -> Result<Self> {
         let mut h = Handle {
             session,
@@ -140,7 +140,7 @@ impl<'a, T: Read + Write> Handle<'a, T> {
     }
 }
 
-impl<'a, T: SetReadTimeout + Read + Write> Handle<'a, T> {
+impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     /// Block until the selected mailbox changes.
     ///
     /// This method differs from [`Handle::wait`] in that it will periodically refresh the IDLE
@@ -209,7 +209,7 @@ impl Evented for Signal {
     }
 }
 
-impl<'a, T: Read + Write + Async + Send> Handle<'a, T>
+impl<'a, T: Read + Write + Async + 'a> Handle<'a, T>
     where <T as Async>::Ev: Send
 {
     const DATA: Token = Token(0);
@@ -260,20 +260,20 @@ impl<'a, T: Read + Write + Async + Send> Handle<'a, T>
     }
 }
 
-impl<'a, T: Read + Write> Drop for Handle<'a, T> {
+impl<'a, T: Read + Write + 'a> Drop for Handle<'a, T> {
     fn drop(&mut self) {
         // we don't want to panic here if we can't terminate the Idle
         let _ = self.terminate().is_ok();
     }
 }
 
-impl SetReadTimeout for TcpStream {
+impl<'a> SetReadTimeout for TcpStream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         TcpStream::set_read_timeout(self, timeout).map_err(Error::Io)
     }
 }
 
-impl SetReadTimeout for TlsStream<TcpStream> {
+impl<'a> SetReadTimeout for TlsStream<TcpStream> {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.get_ref().set_read_timeout(timeout).map_err(Error::Io)
     }
