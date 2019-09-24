@@ -227,36 +227,41 @@ impl<'a, T: Read + Write + Async + 'a> Handle<'a, T>
     {
         let ev = {
             let stream = self.session.stream.get_ref();
-            stream.set_nonblocking(true)?;
             let ev = stream.get_evented();
             self.poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+            stream.set_nonblocking(true)?;
             ev
         };
 
-        let mut events = Events::with_capacity(2);
+        let res = (|| {
+            let mut events = Events::with_capacity(2);
 
-        'wait: loop {
-            self.poll.poll(&mut events, Some(self.keepalive))?;
-            if events.is_empty() {
-                // Timeout: we need to refresh the IDLE connection
-                self.terminate()?;
-                self.init()?;
-            } else {
-                for event in events.iter() {
-                    if event.token() == Self::STOP { break 'wait; }
-                    let mut v = Vec::new();
-                    match self.session.readline(&mut v) {
-                        Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
-                        Err(e) => return Err(e),
-                        Ok(_) => break 'wait,
+            'wait: loop {
+                self.poll.poll(&mut events, Some(self.keepalive))?;
+                if events.is_empty() {
+                    // Timeout: we need to refresh the IDLE connection
+                    self.session.stream.get_ref().set_nonblocking(false)?;
+                    self.terminate()?;
+                    self.init()?;
+                    self.session.stream.get_ref().set_nonblocking(true)?;
+                } else {
+                    for event in events.iter() {
+                        if event.token() == Self::STOP { break 'wait; }
+                        let mut v = Vec::new();
+                        match self.session.readline(&mut v) {
+                            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                            Err(e) => return Err(e),
+                            Ok(_) => break 'wait,
+                        }
+                        self.poll.reregister(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
                     }
-                    self.poll.reregister(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
                 }
             }
-        }
+            Ok(())
+        })();
 
-        self.session.stream.get_ref().set_nonblocking(false)?;
-        Ok(())
+        let cleanup_res = self.session.stream.get_ref().set_nonblocking(false);
+        res.and(cleanup_res)
     }
 }
 
