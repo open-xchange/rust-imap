@@ -38,6 +38,7 @@ pub struct Handle<'a, T: Read + Write + 'a> {
 ///
 /// Examples of where this is useful is for `Handle::wait_keepalive` and
 /// `Handle::wait_timeout`.
+/// XXX: does this have to be public?
 pub trait SetReadTimeout {
     /// Set the timeout for subsequent reads to the given one.
     ///
@@ -51,6 +52,7 @@ pub trait SetReadTimeout {
 /// transport to support interruptible operations.
 ///
 /// Examples of where this is usedful is for `Handle::wait_interruptible`.
+/// XXX: does this have to be public?
 pub trait Async {
     /// The concrete type of the Evented implementation returned by `get_evented`.
     type Ev: Evented;
@@ -174,6 +176,7 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
 }
 
 /// A generic signal used to terminate a `wait_interruptible`.
+/// XXX: does this have to be public?
 #[derive(Debug)]
 pub struct Signal {
     registration: Registration,
@@ -227,7 +230,8 @@ impl<'a, T: Read + Write + Async + 'a> Handle<'a, T>
     {
         let ev = {
             let stream = self.session.stream.get_ref();
-            stream.set_nonblocking(true)?;
+            // there is no need to set stream to nonblocking.
+            // stream.set_nonblocking(true)?;
             let ev = stream.get_evented();
             self.poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
             ev
@@ -246,6 +250,22 @@ impl<'a, T: Read + Write + Async + 'a> Handle<'a, T>
                     if event.token() == Self::STOP { break 'wait; }
                     let mut v = Vec::new();
                     match self.session.readline(&mut v) {
+                        // This is wrong! If readline() would block then you would loose the already
+                        // read characters, unless you move `v` to the outer scope.
+                        //
+                        // Non-blocking is not required here! If data is available, read it,
+                        // whether we block or not, that does not matter. All other IMAP calls
+                        // would block likewise, and those you cannot abort either. Also the
+                        // terminate() call uses blocking writes.
+                        //
+                        // So this would become: self.session.readline(&mut v)?; break 'wait;
+                        // And reregister below can be removed.
+                        //
+                        // If you don't use nonblocking you can also remove all the set_nonblocking
+                        // calls in Async and it's implementations.
+                        //
+                        // You can of course use nonblocking mode, but I don't see a big advantage
+                        // here, as everything else is still blocking.
                         Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
                         Err(e) => return Err(e),
                         Ok(_) => break 'wait,
@@ -255,7 +275,8 @@ impl<'a, T: Read + Write + Async + 'a> Handle<'a, T>
             }
         }
 
-        self.session.stream.get_ref().set_nonblocking(false)?;
+        // We don't need nonblocking
+        // self.session.stream.get_ref().set_nonblocking(false)?;
         Ok(())
     }
 }
@@ -280,6 +301,7 @@ impl<'a> SetReadTimeout for TlsStream<TcpStream> {
 }
 
 /// A copy of `mio::unix::EventedFd` which stores the `RawFd` instead of referencing it.
+/// XXX:Needs to be public?
 pub struct EventedFd(RawFd);
 
 impl Evented for EventedFd {
