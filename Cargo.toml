@@ -31,7 +31,7 @@ regex = "1.0"
 bufstream = "0.1"
 # imap-proto = "0.7"
 imap-proto = { git = "https://github.com/open-xchange/tokio-imap", branch = "metadata" }
-mio = "0.6"
+mio = { git = "https://github.com/open-xchange/mio/", branch = "epoll-create1" }
 nom = "4.0"
 base64 = "0.10"
 chrono = "0.4"

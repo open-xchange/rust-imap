@@ -3,12 +3,15 @@
 
 use client::Session;
 use error::{Error, Result};
-use mio::*;
 use native_tls::TlsStream;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::{Arc, Mutex};
+use mio::{Events, Interests, Poll, Token};
+use mio::unix::SourceFd;
+pub use mio::Waker;
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
 ///
@@ -31,6 +34,7 @@ pub struct Handle<'a, T: Read + Write + 'a> {
     keepalive: Duration,
     done: bool,
     poll: Poll,
+    waker: Arc<Mutex<Waker>>,
 }
 
 /// Must be implemented for a transport in order for a `Session` using that transport to support
@@ -52,11 +56,8 @@ pub trait SetReadTimeout {
 ///
 /// Examples of where this is usedful is for `Handle::wait_interruptible`.
 pub trait Async {
-    /// The concrete type of the Evented implementation returned by `get_evented`.
-    type Ev: Evented;
-
-    /// Returns an implementation of Evented for async IO.
-    fn get_evented(&self) -> Self::Ev;
+    /// Returns a `RawFd` for the stream.
+    fn get_fd(&self) -> RawFd;
 
     /// Set the transport to be blocking (the default, or when `nonblocking` is
     /// `false`) or nonblocking (when `nonblocking` is `true`).
@@ -66,12 +67,19 @@ pub trait Async {
 }
 
 impl<'a, T: Read + Write + 'a> Handle<'a, T> {
+
+    const DATA: Token = Token(0);
+    const STOP: Token = Token(1);
+
     pub(crate) fn make(session: &'a mut Session<T>) -> Result<Self> {
+        let poll = Poll::new()?;
+        let waker = Waker::new(poll.registry(), Self::STOP)?;
         let mut h = Handle {
             session,
             keepalive: Duration::from_secs(29 * 60),
             done: false,
-            poll: Poll::new()?,
+            poll,
+            waker: Arc::new(Mutex::new(waker)),
         };
         h.init()?;
         Ok(h)
@@ -173,95 +181,43 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
     }
 }
 
-/// A generic signal used to terminate a `wait_interruptible`.
-#[derive(Debug)]
-pub struct Signal {
-    registration: Registration,
-    set_readiness: SetReadiness,
-}
+impl<'a, T: Read + Write + Async + 'a> Handle<'a, T> {
 
-impl Signal {
-    fn new() -> Signal {
-        let (registration, set_readiness) = Registration::new2();
-        Signal {
-            registration,
-            set_readiness,
-        }
-    }
+    /// Returns a `Waker` which can be used to interrupt a pending `wait_interruptible`.
+    pub fn get_interrupt(&mut self) -> Arc<Mutex<Waker>> { self.waker.clone() }
 
-    /// Send the signal, usually to terminate a `wait_interruptible`.
-    pub fn signal(self) -> Result<()>{
-        self.set_readiness.set_readiness(Ready::readable()).map_err(Error::Io)
-    }
-}
-
-impl Evented for Signal {
-    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()> {
-        self.registration.register(poll, token, interest,opts)
-    }
-
-    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()> {
-        self.registration.reregister(poll, token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
-        poll.deregister(&self.registration)
-    }
-}
-
-impl<'a, T: Read + Write + Async + 'a> Handle<'a, T>
-    where <T as Async>::Ev: Send
-{
-    const DATA: Token = Token(0);
-    const STOP: Token = Token(1);
-
-    /// Returns a `Signal` which can be used to interrupt a pending `wait_interruptible`.
-    pub fn get_interrupt(&mut self) -> Result<Signal> {
-        let signal = Signal::new();
-        self.poll.register(&signal, Self::STOP, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-        Ok(signal)
-    }
-
-    /// Returns a pair of functions which can be used to wait and to stop that wait.
+    /// Block until the selected mailbox changes.
+    ///
+    /// The function also returns when the previously configured timeout expires
+    /// or the `Waker` returned by a previous call to `get_interrupt` is used.
     pub fn wait_interruptible(mut self) -> Result<()>
     {
-        let ev = {
-            let stream = self.session.stream.get_ref();
-            let ev = stream.get_evented();
-            self.poll.register(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-            stream.set_nonblocking(true)?;
-            ev
-        };
+        let stream = self.session.stream.get_ref();
+        self.poll.registry().register(&SourceFd(&stream.get_fd()), Self::DATA, Interests::READABLE)?;
 
-        let res = (|| {
-            let mut events = Events::with_capacity(2);
+        let mut events = Events::with_capacity(2);
 
-            'wait: loop {
-                self.poll.poll(&mut events, Some(self.keepalive))?;
-                if events.is_empty() {
-                    // Timeout: we need to refresh the IDLE connection
-                    self.session.stream.get_ref().set_nonblocking(false)?;
-                    self.terminate()?;
-                    self.init()?;
+        loop {
+            self.poll.poll(&mut events, Some(self.keepalive))?;
+            if events.is_empty() {
+                // Timeout: we need to refresh the IDLE connection
+                self.terminate()?;
+                self.init()?;
+            } else {
+                for event in events.iter() {
+                    if event.token() == Self::STOP { return Ok(()); }
                     self.session.stream.get_ref().set_nonblocking(true)?;
-                } else {
-                    for event in events.iter() {
-                        if event.token() == Self::STOP { break 'wait; }
-                        let mut v = Vec::new();
-                        match self.session.readline(&mut v) {
-                            Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
-                            Err(e) => return Err(e),
-                            Ok(_) => break 'wait,
-                        }
-                        self.poll.reregister(&ev, Self::DATA, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+                    let mut v = Vec::new();
+                    let res = self.session.readline(&mut v);
+                    let cleanup_res = self.session.stream.get_ref().set_nonblocking(false);
+                    match res {
+                        Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {},
+                        Err(e) => return Err(e),
+                        Ok(_) => return cleanup_res,
                     }
                 }
             }
-            Ok(())
-        })();
-
-        let cleanup_res = self.session.stream.get_ref().set_nonblocking(false);
-        res.and(cleanup_res)
+        }
     }
 }
 
@@ -284,29 +240,8 @@ impl<'a> SetReadTimeout for TlsStream<TcpStream> {
     }
 }
 
-/// A copy of `mio::unix::EventedFd` which stores the `RawFd` instead of referencing it.
-pub struct EventedFd(RawFd);
-
-impl Evented for EventedFd {
-    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()>
-    {
-        unix::EventedFd(&self.0).register(poll, token, interest, opts)
-    }
-
-    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> io::Result<()>
-    {
-        unix::EventedFd(&self.0).reregister(poll, token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
-        unix::EventedFd(&self.0).deregister(poll)
-    }
-}
-
 impl Async for TcpStream {
-    type Ev = EventedFd;
-
-    fn get_evented(&self) -> Self::Ev { EventedFd(self.as_raw_fd()) }
+    fn get_fd(&self) -> RawFd { self.as_raw_fd() }
 
     fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
         TcpStream::set_nonblocking(self, nonblocking).map_err(Error::Io)
@@ -314,9 +249,7 @@ impl Async for TcpStream {
 }
 
 impl<S: Read + Write + Async> Async for TlsStream<S> {
-    type Ev = S::Ev;
-
-    fn get_evented(&self) -> Self::Ev { self.get_ref().get_evented() }
+    fn get_fd(&self) -> RawFd { self.get_ref().get_fd() }
 
     fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
         self.get_ref().set_nonblocking(nonblocking)
