@@ -32,7 +32,7 @@ bufstream = "0.1"
 # imap-proto = "0.7"
 imap-proto = { git = "https://github.com/open-xchange/tokio-imap", branch = "metadata" }
 mio = { git = "https://github.com/open-xchange/mio/", branch = "epoll-create1" }
-nom = "4.0"
+nom = "5"
 base64 = "0.10"
 chrono = "0.4"
 
